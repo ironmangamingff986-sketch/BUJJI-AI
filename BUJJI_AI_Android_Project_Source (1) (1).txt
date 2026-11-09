@@ -1,0 +1,560 @@
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/viewmodel/BujjiViewModel.kt
+// ====================================================
+
+package com.bujji.ai.viewmodel
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.bujji.ai.data.GeminiRepository
+import com.bujji.ai.engine.OfflineCommandEngine
+import com.bujji.ai.speech.OfflineSpeechManager
+import com.bujji.ai.model.BujjiUiState
+import com.bujji.ai.model.Message
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+class BujjiViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val _uiState = MutableStateFlow(BujjiUiState())
+    val uiState: StateFlow<BujjiUiState> = _uiState.asStateFlow()
+
+    private val offlineCommandEngine = OfflineCommandEngine(application)
+    private val geminiRepository = GeminiRepository()
+    private var speechManager: OfflineSpeechManager? = null
+
+    init {
+        speechManager = OfflineSpeechManager(
+            context = application,
+            onResult = { transcript -> handleIncomingTranscript(transcript) },
+            onRmsChanged = { rms ->
+                val normalized = (rms / 10f).coerceIn(0f, 1f)
+                _uiState.update { it.copy(audioVolume = normalized) }
+            },
+            onError = { error ->
+                _uiState.update { it.copy(isListening = false, errorMessage = error) }
+            }
+        )
+    }
+
+    fun onMicrophonePermissionResult(isGranted: Boolean) {
+        _uiState.update { it.copy(hasMicrophonePermission = isGranted) }
+    }
+
+    fun onInputQueryChanged(newQuery: String) {
+        _uiState.update { it.copy(inputQuery = newQuery) }
+    }
+
+    fun setLanguage(lang: String) {
+        _uiState.update { it.copy(language = lang) }
+    }
+
+    fun toggleListening() {
+        val currentState = _uiState.value
+        if (currentState.isListening) {
+            speechManager?.stopListening()
+            _uiState.update { it.copy(isListening = false, audioVolume = 0f) }
+        } else {
+            val langCode = if (currentState.language == "te") "te-IN" else "en-IN"
+            speechManager?.startListening(languageCode = langCode, preferOffline = true)
+            _uiState.update { it.copy(isListening = true, errorMessage = null) }
+        }
+    }
+
+    private fun handleIncomingTranscript(transcript: String) {
+        _uiState.update { it.copy(isListening = false, lastTranscript = transcript) }
+        processQuery(transcript)
+    }
+
+    fun sendQuery(text: String = _uiState.value.inputQuery) {
+        val query = text.trim()
+        if (query.isEmpty()) return
+        _uiState.update { it.copy(inputQuery = "") }
+        processQuery(query)
+    }
+
+    private fun processQuery(query: String) {
+        val currentLang = _uiState.value.language
+        val userMsg = Message(sender = "user", text = query, language = currentLang)
+        _uiState.update { it.copy(messages = listOf(userMsg) + it.messages) }
+
+        // 1. Check Offline Commands
+        val offlineResult = offlineCommandEngine.evaluate(query)
+        if (offlineResult != null && offlineResult.isHandled) {
+            val bujjiMsg = Message(
+                sender = "bujji",
+                text = offlineResult.responseText,
+                isOnline = false,
+                language = if (offlineResult.isTelugu) "te" else "en"
+            )
+            _uiState.update {
+                it.copy(
+                    messages = listOf(bujjiMsg) + it.messages,
+                    lastResponse = offlineResult.responseText
+                )
+            }
+            speechManager?.speak(offlineResult.responseText, offlineResult.isTelugu)
+            return
+        }
+
+        // 2. Query Online Gemini AI
+        _uiState.update { it.copy(isProcessing = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = geminiRepository.queryGemini(query, currentLang)
+            val isTe = currentLang == "te" || query.any { it in '\u0C00'..'\u0C7F' }
+
+            result.onSuccess { replyText ->
+                val bujjiMsg = Message(sender = "bujji", text = replyText, isOnline = true, language = if (isTe) "te" else "en")
+                _uiState.update {
+                    it.copy(isProcessing = false, messages = listOf(bujjiMsg) + it.messages, lastResponse = replyText)
+                }
+                speechManager?.speak(replyText, isTe)
+            }.onFailure { error ->
+                val fallbackText = if (isTe) "కనెక్టివిటీ సమస్య వచ్చింది బాస్." else "Neural link momentarily disrupted."
+                val bujjiMsg = Message(sender = "bujji", text = fallbackText, isOnline = false, language = if (isTe) "te" else "en")
+                _uiState.update {
+                    it.copy(isProcessing = false, messages = listOf(bujjiMsg) + it.messages, lastResponse = fallbackText)
+                }
+                speechManager?.speak(fallbackText, isTe)
+            }
+        }
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/model/BujjiUiState.kt
+// ====================================================
+
+package com.bujji.ai.model
+
+/**
+ * Immutable UI State for BUJJI AI native Android interface
+ * Optimized for mobile devices with 6GB RAM profile
+ */
+data class BujjiUiState(
+    val isOnline: Boolean = true,
+    val isListening: Boolean = false,
+    val isSpeaking: Boolean = false,
+    val isProcessing: Boolean = false,
+    val audioVolume: Float = 0f,
+    val language: String = "auto", // "auto", "te", "en"
+    val inputQuery: String = "",
+    val lastTranscript: String = "",
+    val lastResponse: String = "నమస్కారం బాస్! నేను బుజ్జిని.",
+    val messages: List<Message> = emptyList(),
+    val isTorchActive: Boolean = false,
+    val isRadarActive: Boolean = false,
+    val batteryLevel: Int = 88,
+    val ramAllocatedMb: Int = 2140,
+    val hasMicrophonePermission: Boolean = false,
+    val errorMessage: String? = null
+)
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/model/Message.kt
+// ====================================================
+
+package com.bujji.ai.model
+
+import java.util.UUID
+
+/**
+ * Chat message model representing exchanges between user and BUJJI
+ */
+data class Message(
+    val id: String = UUID.randomUUID().toString(),
+    val sender: String, // "user" or "bujji"
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val isOnline: Boolean = true,
+    val language: String = "auto"
+)
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/engine/OfflineCommandEngine.kt
+// ====================================================
+
+package com.bujji.ai.engine
+
+import android.content.Context
+import android.hardware.camera2.CameraManager
+import android.os.BatteryManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class OfflineCommandEngine(private val context: Context) {
+
+    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+
+    data class CommandResult(
+        val isHandled: Boolean,
+        val responseText: String,
+        val isTelugu: Boolean
+    )
+
+    fun evaluate(query: String): CommandResult? {
+        val input = query.lowercase(Locale.ROOT)
+        val isTelugu = input.any { it in '\u0C00'..'\u0C7F' }
+
+        // Battery
+        if (input.contains("battery") || input.contains("చార్జింగ్") || input.contains("బ్యాటరీ")) {
+            val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val level = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 88
+            val reply = if (isTelugu) "ఆర్క్ రియాక్టర్ పవర్ $level% వద్ద ఉంది బాస్!" else "Arc Reactor core is at $level%."
+            return CommandResult(true, reply, isTelugu)
+        }
+
+        // Torch / Flashlight
+        if (input.contains("torch on") || input.contains("flashlight on") || input.contains("లైట్ వెలిగించు")) {
+            toggleTorch(true)
+            val reply = if (isTelugu) "ఫ్లాష్‌లైట్ ఆన్ చేశాను బాస్!" else "High-beam torch engaged."
+            return CommandResult(true, reply, isTelugu)
+        }
+        if (input.contains("torch off") || input.contains("flashlight off") || input.contains("లైట్ ఆపు")) {
+            toggleTorch(false)
+            val reply = if (isTelugu) "ఫ్లాష్‌లైట్ ఆఫ్ చేశాను బాస్." else "Torch deactivated."
+            return CommandResult(true, reply, isTelugu)
+        }
+
+        // Time
+        if (input.contains("time") || input.contains("సమయం")) {
+            val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
+            val reply = if (isTelugu) "ప్రస్తుత సమయం $time బాస్!" else "The current local time is $time."
+            return CommandResult(true, reply, isTelugu)
+        }
+
+        return null
+    }
+
+    private fun toggleTorch(enable: Boolean) {
+        try {
+            cameraManager?.let { cm ->
+                val cameraId = cm.cameraIdList.firstOrNull() ?: return
+                cm.setTorchMode(cameraId, enable)
+            }
+        } catch (_: Exception) {}
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/speech/OfflineSpeechManager.kt
+// ====================================================
+
+package com.bujji.ai.speech
+
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import java.util.Locale
+
+class OfflineSpeechManager(
+    private val context: Context,
+    private val onResult: (String) -> Unit,
+    private val onRmsChanged: (Float) -> Unit,
+    private val onError: (String) -> Unit
+) {
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var ttsReady = false
+
+    init {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {}
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) { onRmsChanged(rmsdB) }
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onError(error: Int) { onError("Speech code: $error") }
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) onResult(matches[0])
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {}
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+        }
+
+        textToSpeech = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                ttsReady = true
+                textToSpeech?.language = Locale("te", "IN")
+            }
+        }
+    }
+
+    fun startListening(languageCode: String = "te-IN", preferOffline: Boolean = true) {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageCode)
+            if (preferOffline) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        }
+        speechRecognizer?.startListening(intent)
+    }
+
+    fun stopListening() { speechRecognizer?.stopListening() }
+
+    fun speak(text: String, isTelugu: Boolean = false) {
+        if (!ttsReady) return
+        textToSpeech?.language = if (isTelugu) Locale("te", "IN") else Locale.US
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "BUJJI")
+    }
+
+    fun release() {
+        speechRecognizer?.destroy()
+        textToSpeech?.shutdown()
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/data/GeminiRepository.kt
+// ====================================================
+
+package com.bujji.ai.data
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+
+class GeminiRepository(private val backendUrl: String = "https://your-bujji-api-endpoint.com") {
+
+    suspend fun queryGemini(message: String, language: String = "auto"): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val url = URL("$backendUrl/api/chat")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 5000
+                readTimeout = 8000
+                doOutput = true
+            }
+
+            val payload = JSONObject().apply {
+                put("message", message)
+                put("language", language)
+            }
+
+            OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()); it.flush() }
+
+            if (conn.responseCode == 200) {
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val reply = JSONObject(body).optString("reply", "Understood, Captain.")
+                Result.success(reply)
+            } else {
+                Result.failure(Exception("HTTP ${conn.responseCode}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/ui/BujjiScreen.kt
+// ====================================================
+
+package com.bujji.ai.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import com.bujji.ai.viewmodel.BujjiViewModel
+
+@Composable
+fun BujjiScreen(
+    viewModel: BujjiViewModel,
+    onRequestMicPermission: () -> Unit
+) {
+    val uiState by viewModel.uiState.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF040711))
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("BUJJI AI ASSISTANT", color = Color(0xFF00F0FF))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            items(uiState.messages) { msg ->
+                Text("${msg.sender}: ${msg.text}", color = Color.White)
+            }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { viewModel.toggleListening() }) {
+                Icon(Icons.Default.Mic, contentDescription = "Mic", tint = Color(0xFFFF6B00))
+            }
+            OutlinedTextField(
+                value = uiState.inputQuery,
+                onValueChange = { viewModel.onInputQueryChanged(it) },
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = { viewModel.sendQuery() }) {
+                Icon(Icons.Default.Send, contentDescription = "Send", tint = Color(0xFF00F0FF))
+            }
+        }
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/java/com/bujji/ai/MainActivity.kt
+// ====================================================
+
+package com.bujji.ai
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
+import com.bujji.ai.ui.BujjiScreen
+import com.bujji.ai.viewmodel.BujjiViewModel
+
+class MainActivity : ComponentActivity() {
+
+    private val viewModel: BujjiViewModel by viewModels()
+
+    private val requestAudioLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        viewModel.onMicrophonePermissionResult(isGranted)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            viewModel.onMicrophonePermissionResult(true)
+        } else {
+            requestAudioLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+
+        setContent {
+            BujjiScreen(viewModel = viewModel, onRequestMicPermission = {
+                requestAudioLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            })
+        }
+    }
+}
+
+
+// ====================================================
+// FILE: app/src/main/AndroidManifest.xml
+// ====================================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bujji.ai">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="BUJJI AI"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+
+// ====================================================
+// FILE: app/build.gradle.kts
+// ====================================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.bujji.ai"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.bujji.ai"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+    implementation(composeBom)
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+
